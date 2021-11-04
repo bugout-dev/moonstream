@@ -384,6 +384,7 @@ def next_event(
         include_end=False,
     )
     parsed_filters = parse_filters(query, user_subscriptions)
+    print("parsed_filters", parsed_filters)
     if parsed_filters is None:
         return None
 
