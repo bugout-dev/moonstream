@@ -1,11 +1,31 @@
+from array import array
+from ast import operator
+from ctypes import Union
+from email.policy import default
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, cast
+from multiprocessing import Condition
+from re import A, L
+from tkinter.messagebox import NO
+from typing import Any, Dict, List, Optional, Tuple
+from black import patch_click
 
 from bugout.app import Bugout
 from bugout.data import BugoutResource
 from moonstreamdb.blockchain import AvailableBlockchainType, get_label_model
-from sqlalchemy import and_, or_, text
+from sqlalchemy import (
+    and_,
+    desc,
+    or_,
+    select,
+    text,
+    func,
+    types,
+    cast,
+    String,
+    Integer,
+    Numeric,
+)
 from sqlalchemy.orm import Query, Session, query_expression
 from sqlalchemy.sql.expression import label
 
@@ -15,6 +35,7 @@ from ..stream_queries import StreamQuery
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARN)
+logging.getLogger("sqlalchemy.engine").setLevel(logging.INFO)
 
 
 ethereum_event_type = "ethereum_blockchain"
@@ -31,34 +52,6 @@ default_time_interval_seconds: int = 5 * 60
 estimated_events_per_time_interval: float = 5 * 800
 
 
-@dataclass
-class ArgsFilters:
-    name: str
-    value: Any
-    type: str
-
-
-@dataclass
-class LabelsFilters:
-
-    name: str
-    type: str
-    args: List[ArgsFilters] = field(default_factory=list)
-
-
-@dataclass
-class AddressFilters:
-
-    address: str
-    label_filters: List[LabelsFilters] = field(default_factory=list)
-
-
-@dataclass
-class Filters:
-
-    addresses: List[AddressFilters] = field(default_factory=list)
-
-
 class MoonwormProvider:
     def __init__(
         self,
@@ -72,32 +65,64 @@ class MoonwormProvider:
         self.description = description
         self.valid_period_seconds = streamboaundary_range_limit
 
-    def default_filters(self, subscriptions: List[BugoutResource]) -> Filters:
+    def default_filters(
+        self, subscriptions: List[BugoutResource]
+    ) -> Tuple[data.EventFilters, List[str]]:
         """
         Default filter strings for the given list of subscriptions.
         """
-        filters = Filters()
-        for subscription in subscriptions:
-            subscription_address = cast(
-                Optional[str], subscription.resource_data.get("address")
-            )
-            if subscription_address is not None:
 
-                # How apply labels?
-                filters.addresses.append(
-                    AddressFilters(address=subscription_address, label_filters=[])
-                )
+        addresses = []
+
+        for subscription in subscriptions:
+            subscription_address = subscription.resource_data.get("address")
+            if subscription_address is not None:
+                addresses.append(subscription_address)
+
             else:
                 logger.warn(
                     f"Could not find subscription address for subscription with resource id: {subscription.id}"
                 )
-        return filters
+        # Add addresses only without filters
+        # Predefined query for usual frontend behaivior
 
-    def apply_query_filters(self, filters: Filters, query_filters: StreamQuery):
+        if addresses:
+
+            event_filters = data.EventFilters.parse_obj(
+                [
+                    {
+                        "$map": [
+                            {"data.block_number": None},
+                            {"data.address": None},
+                            {"data.transaction_hash": None},
+                            {"data.label_data": None},
+                            {"data.block_timestamp": None},
+                            {"data.log_index": None},
+                            {"data.created_at": None},
+                        ]
+                    },
+                    {"$sort": {"data.block_timestamp": "desc"}},
+                    {
+                        "$match": {
+                            "data.label": "moonworm",
+                            "data.address": {"$in": addresses},
+                        }
+                    },
+                ]
+            )
+        else:
+
+            event_filters = data.EventFilters()
+
+        return event_filters, addresses
+
+    def apply_query_filters(
+        self, filters: data.EventFilters, query_filters: StreamQuery
+    ):
         """
         Required to implement filters wich depends on procider
         """
-        pass
+        return filters
 
     def events(self, row: Tuple) -> data.Event:
         """
@@ -130,12 +155,13 @@ class MoonwormProvider:
         self,
         query: StreamQuery,
         user_subscriptions: Dict[str, List[BugoutResource]],
-    ) -> Optional[Filters]:
+    ) -> Optional[data.EventFilters]:
         """
         Passes raw filter strings into a Filters object which is used to construct a database query
         for ethereum transactions.
         Right now support only addresses query.
         """
+
         if query.subscription_types and not any(
             subtype == self.event_type for subtype in query.subscription_types
         ):
@@ -146,14 +172,244 @@ class MoonwormProvider:
         # If the user has no subscriptions to this event type, we do not have to return any data!
         if not provider_subscriptions:
             return None
-        parsed_filters = self.default_filters(provider_subscriptions)
+        parsed_filters: Any = {}
 
-        self.apply_query_filters(parsed_filters, query)
+        if not query.event_filters:
+            parsed_filters, addresses = self.default_filters(provider_subscriptions)
 
-        if not (parsed_filters.addresses):
-            return None
+            self.apply_query_filters(parsed_filters, query)
+            if not (addresses):
+                return None
+
+        else:
+            parsed_filters = query.event_filters
 
         return parsed_filters
+
+    def generate_selector(
+        self, filter_name: str, label=None
+    ):  # filter_condition: Union[str, Dict[str, Any]]):
+        """
+        Return selector for column or JSONB
+        """
+
+        constract_select_column = filter_name.split(".")
+
+        label_model = get_label_model(self.blockchain)
+
+        select = label_model
+
+        for name in constract_select_column:
+
+            if name == "data":
+                continue
+
+            if name in data.accessible_columns:
+                select = getattr(select, name)
+
+            elif name == "type":
+                select = select.label_data["type"].astext
+
+            elif name == "name":
+                select = select.label_data["name"].astext
+
+            elif name == "args":
+                select = getattr(select, "label_data")["args"]
+
+            else:
+                # astext must be applied only on last key of JSONB right now accsess to variable more nested then args produce error
+
+                select = select[name].astext
+
+        if label:
+            select = select.label(label)
+
+        return select
+
+    def generate_filter_expression(self, selector: Any, operator: str, value: Any):
+        """
+        Generate filters wich be apply to sqlalchemy query
+        """
+
+        if operator == "==":
+            return selector == value
+        elif operator == "$in":
+            return selector.in_(value)
+        elif operator == "$gt":
+            return selector > value
+        elif operator == "$lt":
+            return selector < value
+        elif operator == "$gte":
+            return selector >= value
+        elif operator == "$lte":
+            return selector <= value
+
+    def generate_filters(self, filters_block):
+        """
+        Parse our mongo like filters statment block
+
+
+        As example:
+
+            {
+                "$match": {
+                    "data.args.from": "0x0000000000000000000000000000000000000000",
+                    "data.type": "event",
+                    "data.name": "Transfer",
+                    "data.address": "<contract address>",
+                    "data.args.tokenId": {
+                        "$cast": "int",
+                        "$in": [
+                        11000, 12000, 13000, 14000, 15000, 16000, 17000, 18000, 19000, 20000
+                        ]
+                    }
+                }
+            }
+        """
+
+        list_of_filters: List[Dict[str, Any]] = []
+
+        # it must be or/and nesting so we probably must start from most nested part and just apply nesting one by one
+        # mainly need reverse the list of operations
+
+        def unnesting_filters(filters_states, list_of_filters, condition="AND"):
+            """
+            Write new filters to filters list
+            {
+                'data.args.from': '0x0000000000000000000000000000000000000000',
+                'data.type': 'event',
+                'data.name': 'Transfer',
+                'data.address': '<contract_address>',
+                'data.args.tokenId': {'$cast': 'int', '$in':[11000, 12000, 13000, 14000, 15000, 16000, 17000, 18000, 19000, 20000]
+            }
+            """
+
+            filter = {condition: []}
+
+            for key, value in filters_states.items():
+
+                if key not in data.conditions_keys:
+
+                    selector = self.generate_selector(key)
+
+                    cast_to = None
+
+                    if isinstance(value, str):
+                        operator = "=="
+
+                    elif isinstance(value, dict):
+
+                        conditions = value.items()
+
+                        for operation, op_value in conditions:
+                            if operation == "$cast":
+                                if op_value == "str":
+                                    cast_to = String
+                                elif op_value == "float":
+                                    cast_to = Numeric
+                                elif op_value == "int":
+                                    cast_to = Integer
+
+                            elif operation in ["$in", "$gt", "$lt", "$gte", "$lte"]:
+                                value = op_value
+                                operator = operation
+
+                    if cast_to:
+                        selector = cast(selector, cast_to)
+
+                    filter_expression = self.generate_filter_expression(
+                        selector, operator, value
+                    )
+                    filter[condition].append(filter_expression)
+
+            list_of_filters.append(filter)
+
+            if "AND" in filters_states:
+                return filters_states["AND"], "AND"
+
+            if "OR" in filters_states:
+                return filters_states["OR"], "OR"
+
+            return None, None
+
+        filters_block, condition = unnesting_filters(
+            getattr(filters_block, "match"), list_of_filters
+        )
+
+        while filters_block:
+            filters_block, condition = unnesting_filters(
+                filters_block, list_of_filters, condition
+            )
+
+        # we reverse filters and apply one by one as onion
+        list_of_filters.reverse()
+
+        filters = None
+
+        for filter in list_of_filters:
+
+            if "AND" in filter:
+                if filters is not None:
+                    filter["AND"].append(filters)
+                filters = and_(*filter["AND"])
+
+            if "OR" in filter:
+                if filters is not None:
+                    filter["OR"].append(filters)
+                filters = or_(*filter["OR"])
+        return filters
+
+    def generate_select(self, select_block):
+        """
+        Generate list of select
+
+         {
+            "$map": [
+                {
+                    "data.args.to": "purchaser"
+                },
+                {
+                    "data.args.tokenId": "tokenId"
+                },
+                {
+                    "block_timestamp": "time_of_sale"
+                }
+            ]
+        }
+        """
+
+        selects = []
+
+        for select in getattr(select_block, "MAP"):
+
+            # do better processing of list of dict
+            for column_name, label in select.items():
+
+                selector = self.generate_selector(column_name, label)
+
+            selects.append(selector)
+
+        return selects
+
+    def generate_order(self, order_block):
+        """
+        Creater order by condition
+        {"$sort": { "data.args.tokenId": "desc" }}
+
+        """
+
+        order_by = []
+
+        for select, ordering in getattr(order_block, "SORT").items():
+
+            selector = self.generate_selector(select)
+
+            if ordering == "desc":
+                order_by.append(selector.desc())
+            if ordering == "asc":
+                order_by.append(selector.asc())
+
+        return order_by
 
     def stream_boundary_validator(
         self, stream_boundary: data.StreamBoundary
@@ -168,7 +424,7 @@ class MoonwormProvider:
         valid_period_seconds = self.valid_period_seconds
 
         _, stream_boundary = validate_stream_boundary(
-            stream_boundary, valid_period_seconds, raise_when_invalid=True
+            stream_boundary, valid_period_seconds, raise_when_invalid=False
         )
         return stream_boundary
 
@@ -176,7 +432,7 @@ class MoonwormProvider:
         self,
         db_session: Session,
         stream_boundary: data.StreamBoundary,
-        parsed_filters: Filters,
+        parsed_filters: data.EventFilters,
     ) -> Query:
         """
         Builds a database query for Ethereum transactions that occurred within the window of time that
@@ -185,15 +441,27 @@ class MoonwormProvider:
 
         Labels = get_label_model(self.blockchain)
 
-        query = db_session.query(
-            Labels.block_number,
-            Labels.address,
-            Labels.transaction_hash,
-            Labels.label_data,
-            Labels.block_timestamp,
-            Labels.log_index,
-            Labels.created_at,
-        ).filter(Labels.label == "moonworm")
+        # process select block
+
+        array_columns = []
+
+        for block in parsed_filters.__root__:
+
+            if isinstance(block, data.MatchFilters):
+
+                filters = self.generate_filters(block)
+
+            elif isinstance(block, data.SelectMap):
+
+                array_columns = self.generate_select(block)
+
+            elif isinstance(block, data.SortCondition):
+
+                order_by = self.generate_order(block)
+
+        query = db_session.query(*array_columns).filter(*filters).order_by(*order_by)
+
+        # apply streamBoundary
 
         if stream_boundary.include_start:
             query = query.filter(Labels.block_timestamp >= stream_boundary.start_time)
@@ -205,31 +473,6 @@ class MoonwormProvider:
                 query = query.filter(Labels.block_timestamp <= stream_boundary.end_time)
             else:
                 query = query.filter(Labels.block_timestamp <= stream_boundary.end_time)
-
-        addresses_filters = []
-
-        for address_filter in parsed_filters.addresses:
-            labels_filters = []
-            for label_filter in address_filter.label_filters:
-
-                labels_filters.append(
-                    and_(
-                        *(
-                            Labels.label_data["type"] == label_filter.type,
-                            Labels.label_data["name"] == label_filter.name,
-                        )
-                    )
-                )
-            addresses_filters.append(
-                and_(
-                    *(
-                        Labels.address == address_filter.address,
-                        or_(*labels_filters),
-                    )
-                )
-            )
-
-        query = query.filter(or_(*addresses_filters))
 
         return query
 
@@ -269,7 +512,12 @@ class MoonwormProvider:
         # do anything to help them get data from teh backend.
         # The error message on the API side when the statement times out:
         # > sqlalchemy.exc.OperationalError: (psycopg2.errors.QueryCanceled) canceling statement due to statement timeout
-        events: List[data.Event] = [self.events(row) for row in ethereum_transactions]
+        # [{"$match":{"data.args.from":"0x0000000000000000000000000000000000000000","data.type":"event","data.name":"Transfer","data.address":"0xA2a13cE1824F3916fC84C65e559391fc6674e6e8","data.args.tokenId":{"$cast":"int","$in":[11000,12000,13000,14000,15000,16000,17000,18000,19000,20000]}}},{"$sort":{"data.args.tokenId":"desc"}},{"$map":[{"data.args.to":"purchaser"},{"data.args.tokenId":"tokenId"},{"block_timestamp":"time_of_sale"}]}]
+
+        if not query.event_filters:
+            events = [self.events(row) for row in ethereum_transactions]
+        else:
+            events = [row for row in ethereum_transactions]
 
         if (stream_boundary.end_time is None) and events:
             stream_boundary.end_time = events[0].event_timestamp
