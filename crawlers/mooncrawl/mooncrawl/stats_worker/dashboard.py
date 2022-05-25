@@ -80,6 +80,10 @@ abi_type_to_dashboards_type = {"function": "methods", "event": "events"}
 BUGOUT_RESOURCE_TYPE_SUBSCRIPTION = "subscription"
 BUGOUT_RESOURCE_TYPE_DASHBOARD = "dashboards"
 
+"""
+test lint
+"""
+
 
 def push_statistics(
     statistics_data: Dict[str, Any],
